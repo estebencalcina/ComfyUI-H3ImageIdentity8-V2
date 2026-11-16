@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import comfy.model_management
 import comfy.utils
 import folder_paths
@@ -61,7 +62,7 @@ class H3Img8V2Create:
         return {"required": {
             "image_1": ("IMAGE",), "vae": ("VAE",),
             "identity_name": ("STRING", {"default": "Personaje_01"}),
-            "reference_short_edge": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32}),
+            "reference_short_edge": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 32}),
             "overwrite_existing": ("BOOLEAN", {"default": False}),
         }, "optional": {f"image_{i}": ("IMAGE",) for i in range(2, 9)}}
     RETURN_TYPES = ("STRING",)
@@ -153,11 +154,35 @@ class H3Img8V2Load:
         return (identity, visions[0])
 
 
-class H3Img8V2Condition:
-    """Provide all stored views to both Qwen and DiT using native MiniMax refs.
+def _soften_reference_latent(z, strength):
+    """Retention <=1: preserve the latent or mix with a spatially blurred copy.
 
-    This reuses cached VAE latents, but Qwen still encodes the reference images.
-    A true tiny 8-view identity embedding requires further model research.
+    Does not amplify latent numerical magnitude. Unlike naive z*1.5, this
+    keeps the reference within a more plausible distribution. This is a
+    *retention* dial, not an attention coefficient or identity guarantee.
+    """
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength >= 1.0:
+        return z
+    if strength <= 0.0:
+        return None
+    # H3 image refs are [1,24,1,h,w]. Blur ONLY spatial axes.
+    b, c, t, h, w = z.shape
+    z2 = z.permute(0, 2, 1, 3, 4).reshape(b*t, c, h, w)
+    softened = F.avg_pool2d(z2.float(), kernel_size=9, stride=1, padding=4)
+    softened = F.avg_pool2d(softened, kernel_size=9, stride=1, padding=4)
+    softened = softened.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    return z * strength + softened.to(z.dtype) * (1.0 - strength)
+
+
+class H3Img8V2Condition:
+    """Eight native H3-Image references with explicit retention and token copies.
+
+    Original H3 RefMod's 'strength' is a retention between 0 and 1, so at 1.0
+    we already have maximum unchanged reference. For a stronger influence, use
+    duplicated native reference blocks (token copies), optionally prioritising
+    one source view. This is experimental; copies consume more VRAM and cannot
+    ensure exact facial matching. Saved .safetensors are read-only and unchanged.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -165,29 +190,77 @@ class H3Img8V2Condition:
             "clip": ("CLIP",),
             "identity": ("H3IMAGE_NATIVE_IDENTITY",),
             "prompt": ("STRING", {"multiline": True,
-                      "default": "A cinematic portrait of the same person in <Picture 1> through <Picture 8>, natural features."}),
+                      "default": "A natural portrait of the exact same person in all supplied reference pictures."}),
             "width": ("INT", {"default": 1024, "min": 32, "max": 16384, "step": 32}),
             "height": ("INT", {"default": 1024, "min": 32, "max": 16384, "step": 32}),
+            "reference_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                "tooltip": "0=no references; 1=original references intact (strongest retention). Below 1 softens them, not a true attention gain."}),
+            "reference_copies": ("INT", {"default": 1, "min": 1, "max": 3, "step": 1,
+                "tooltip": "1=normal; 2=duplicate all 8 reference blocks in DiT; 3=triple. More influence may be possible but costs VRAM/tokens."}),
+            "face_priority_view": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1,
+                "tooltip": "0=none; 1..8=reference photo to prioritize, ideally clearest frontal facial image."}),
+            "face_priority_copies": ("INT", {"default": 0, "min": 0, "max": 3, "step": 1,
+                "tooltip": "Extra DiT copies of prioritized view. 0=none. Try 1 before 2 or 3."}),
+            "auto_identity_hint": ("BOOLEAN", {"default": True,
+                "tooltip": "Prepend short instruction explaining that all <Picture N> show same person."}),
         }}
     RETURN_TYPES = ("CONDITIONING", "LATENT")
     RETURN_NAMES = ("positive", "latent")
     FUNCTION = "condition"
     CATEGORY = "MiniMax H3-Image / Native RefMod (experimental)"
 
-    def condition(self, clip, identity, prompt, width, height):
+    def condition(self, clip, identity, prompt, width, height,
+                  reference_strength=1.0, reference_copies=1,
+                  face_priority_view=0, face_priority_copies=0,
+                  auto_identity_hint=True):
         if identity.get("format") != _FORMAT:
             raise ValueError("Expected native 8-view H3-Image identity")
         visions, latents = identity["visions"], identity["latents"]
-        if len(visions) != len(latents) or not (1 <= len(visions) <= 8):
+        n = len(visions)
+        if n != len(latents) or not 1 <= n <= 8:
             raise ValueError("Identity reference count mismatch")
-        # Official H3-Image path uses images=[...] and minimax_refs in CONDITIONING.
-        tokens = clip.tokenize(prompt, images=visions)
+
+        strength = float(reference_strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("reference_strength must be between 0 and 1")
+        copies = max(1, min(3, int(reference_copies)))
+        selected = int(face_priority_view)
+        extra = max(0, min(3, int(face_priority_copies)))
+        if selected > n:
+            raise ValueError(f"face_priority_view={selected} but identity has only {n} pictures")
+
+        if strength > 0:
+            tags = ", ".join(f"<Picture {i}>" for i in range(1, n + 1))
+            if auto_identity_hint:
+                prompt = (f"Identity instruction: {tags} all portray the SAME single adult individual. "
+                          "Preserve the distinctive facial geometry, natural asymmetry and age of this person "
+                          "as shown in the reference photos. Do not average the face or invent a different person. "
+                          "Scene request: " + prompt)
+            # Crucial: follow ComfyUI's official H3 Image picture labeling.
+            tokens = clip.tokenize(prompt, images=visions, picture_label="Picture %d: ")
+        else:
+            # Strength zero disables both Qwen visual images and DiT ref latents.
+            tokens = clip.tokenize(prompt)
         cond = clip.encode_from_tokens_scheduled(tokens)
-        blocks = [{"kind": "image", "latent_h": int(z.shape[-2]),
-                   "latent_w": int(z.shape[-1]), "latent": z}
-                  for z in latents]
-        cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": blocks})
-        canvas = torch.zeros([1,24,1,height//16,width//16],
+
+        if strength > 0:
+            blocks = []
+            for z in latents:
+                weighted = _soften_reference_latent(z, strength)
+                blocks.append({"kind": "image", "latent_h": int(weighted.shape[-2]),
+                               "latent_w": int(weighted.shape[-1]), "latent": weighted})
+            # Independent repeated block dictionaries, preserving original tensors.
+            all_blocks = [dict(block) for _ in range(copies) for block in blocks]
+            if selected and extra:
+                all_blocks.extend(dict(blocks[selected - 1]) for _ in range(extra))
+            cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": all_blocks})
+            print(f"[H3Img8V2] identity={identity.get('name', '?')!r}, retention={strength:.2f}, "
+                  f"{n} Qwen pictures, {len(all_blocks)} DiT reference blocks "
+                  f"(copies={copies}, priority={selected}, extras={extra}). "
+                  "More copies increase token/VRAM cost, not identity certainty.")
+        else:
+            print("[H3Img8V2] reference_strength=0: Qwen and DiT refs disabled")
+        canvas = torch.zeros([1, 24, 1, height // 16, width // 16],
                              device=comfy.model_management.intermediate_device())
         return (cond, {"samples": canvas})
 
@@ -200,5 +273,5 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3Img8V2Create": "H3 IMAGE IDENTITY V2 · CREATE 8 PHOTOS",
     "H3Img8V2Load": "H3 IMAGE IDENTITY V2 · LOAD / REFRESH",
-    "H3Img8V2Condition": "H3 IMAGE IDENTITY V2 · T2I CONDITIONING",
+    "H3Img8V2Condition": "H3 IMAGE IDENTITY V2 · STRONG CONDITIONING",
 }
